@@ -1,0 +1,7 @@
+*.html
+*.ipynb
+todo.txt
+Log/**
+Data/**
+__pycache__
+.vscode
