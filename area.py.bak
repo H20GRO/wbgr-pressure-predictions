@@ -1,0 +1,298 @@
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Dict, List, Optional
+import pandas as pd
+from constants import AREAS
+import model
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_squared_error
+from logger import get_logger
+from prepare_data import get_resampled_data
+from validate_data import get_balance_data, DATA_DIR, RESULTS_DIR
+import plotly.express as px
+import plotly.graph_objects as go
+import numpy as np
+
+
+log = get_logger(__name__)
+
+@dataclass
+class Station:
+    """Pumping station"""
+    Name:str
+    PressureSignal:str
+    FlowSignals:List[str] = None
+    MinFlow:float = None
+
+class FlowTypes(Enum):
+    NoFlow = 1
+    Flow = 2
+    ZeroFlow = 3
+
+@dataclass
+class Fit:
+    """Fit"""
+    Name:str #should be unique to be used in hashtables    
+    Station:Station    
+    FlowType:FlowTypes = FlowTypes.NoFlow
+    Quality:Dict[str,float] = field(default_factory=dict) 
+    def __hash__(self) -> int:
+        return hash(self.Name)
+  
+@dataclass
+class PressurePoint:
+    """Point/Signal to predict the presssure.
+    Usage:
+        Call init() to initialize the class before usage    
+    Attributes:
+        Name     
+        PressureSignal  Tag that contains the pressure, required
+        FlowSignal      Tag that containts the flowsignal, optional. If set then two extra models are created for learning.
+        MinFlow         Minimum valid flow, other data is filtered out and considered zero
+        Models          Dictionary of fits, pipelines that holds all the models and its parameters. 
+        Stations        List of Stations that supply pressure, a linear regression model is always fit between station and point      
+    """
+    Name:str
+    PressureSignal:str # y
+    FlowSignal:str   # x 
+    Predictions: Optional[dict[str, pd.DataFrame]] = field(default_factory=dict)
+    MinFlow:Optional[float] = None   
+    Models:Dict[Fit, Pipeline] = field(default_factory=dict)   
+    Stations:List[Station] = field(default_factory=list)   
+    Data:pd.DataFrame = None   
+    Area = None
+
+    def init(self, area, stations:List[Station], data:pd.DataFrame) -> None:
+        if area == None:
+            raise ValueError("area param is empty")
+        if stations ==  None or len(stations) == 0:
+            raise ValueError("stations param is empty or has no members")                        
+        self.Stations = stations
+        self.Area =  area
+        self.Data = data
+        for station in stations:
+            prefix = f"{self.Name}-{station.Name}"
+            if self.FlowSignal:
+                self.Models[Fit(Name=f"{prefix}-Flow", FlowType=FlowTypes.Flow, Station=station)] = model.create_model_pipeline()
+                self.Models[Fit(Name=f"{prefix}-ZeroFlow", Station=station, FlowType=FlowTypes.ZeroFlow)] = model.create_model_pipeline() # only take data where flow is zero
+            self.Models[Fit(Name=f"{prefix}-NoFlow", Station=station)] = model.create_model_pipeline() # disregard flow altogether
+    
+    def _filter_data(self,start_date:datetime, end_date:datetime) -> pd.DataFrame:
+        return self.Data.loc[(self.Data.index > start_date) & (self.Data.index < end_date) ,:]
+        
+    def exec(self, start_date:datetime=datetime(year=2000,month=1,day=1), end_date=datetime(year=2100,month=1,day=1)):          
+        self.df_filtered = self._filter_data(start_date, end_date).dropna()    
+
+        for fit, pipeline in self.Models.items():            
+            pressure_signals = [self.PressureSignal, fit.Station.PressureSignal]    
+            flow_signals, df_data = self._get_data(self.df_filtered , fit, pressure_signals)            
+            X = (df_data[flow_signals]**2)
+            y = (df_data[fit.Station.PressureSignal] - df_data[self.PressureSignal])   
+            pipeline.fit(X, y)
+            predicted_y = pipeline.predict(X)                        
+            fit.Quality["RMSE"] = mean_squared_error(y.values, predicted_y, squared=False)
+            fit.Quality["MSE"] = mean_squared_error(y.values, predicted_y)
+            fit.Quality["Count"] = len(y)
+            fit.Quality["R2"] = pipeline.score(X, y)
+            fit.Quality["Features"] = pipeline.feature_names_in_
+
+            msg = f"""
+            {fit.Name} 
+                ______MSE:{fit.Quality.get('MSE')}
+                ______RMSE:{fit.Quality.get('RMSE')}
+                ______Count:{fit.Quality.get('Count')}
+                ______R2:{fit.Quality.get('R2')}
+                ______Features:{fit.Quality.get('Features')}
+            """
+            log.info(msg)
+
+        self.predict(start_date, end_date)
+        self.calc_bandwidth()
+        self.plot(start_date, end_date)
+        self.plot_bandwidth()
+
+    def _get_data(self, df:pd.DataFrame, fit: Fit, pressure_signals:List[str]): 
+        flow_signals = [self.Area.FlowSignal,*fit.Station.FlowSignals]
+        
+        if fit.FlowType == FlowTypes.Flow:
+            flow_signals.append(self.FlowSignal)
+            df_data = (df
+                [[*flow_signals,*pressure_signals]]
+                [lambda _df:(abs(_df.diff()) > 0)]
+                .dropna()
+                [lambda _df: _df[self.FlowSignal] > self.MinFlow]
+                )          
+            return flow_signals, df_data       
+        if fit.FlowType == FlowTypes.ZeroFlow:
+            df_data = (df
+                [[*flow_signals,*pressure_signals, self.FlowSignal]]
+                [lambda _df:_df[self.FlowSignal] < self.MinFlow]
+                .drop(self.FlowSignal, axis=1) #remove flow signal, 
+                [lambda _df:(abs(_df.diff()) > 0)]
+                .dropna()               
+                )        
+            return flow_signals, df_data
+        df_data = (df
+            [[*flow_signals,*pressure_signals]]   
+            [lambda _df:(abs(_df.diff()) > 0)]   
+            .dropna()               
+            )        
+        return flow_signals, df_data
+        
+                   
+    def predict(self, start_date:datetime, end_date:datetime) -> None:
+        df = self.df_filtered 
+        filter_condition = lambda x: x[0].Quality['MSE'] #select model with lowest MSE
+        if not self.FlowSignal:
+            fit, model = min(self.Models.items(), key=filter_condition) 
+            df_data = df[[self.Area.FlowSignal, *fit.Station.FlowSignals]]**2
+            self.predicted_y = df[fit.Station.PressureSignal] - model.predict(df_data) 
+        else:
+            fit,model_flow = min(((fit, model) for fit, model in self.Models.items() if fit.FlowType == FlowTypes.Flow), key=filter_condition)
+            df_data = df[[self.Area.FlowSignal, *fit.Station.FlowSignals, self.FlowSignal]]
+            self.predicted_y = df[fit.Station.PressureSignal] - model_flow.predict(df_data**2)
+            fit_zeroflow, model_zeroflow = min(((fit, model) for fit, model in self.Models.items() if fit.FlowType == FlowTypes.ZeroFlow), key=filter_condition)
+            df_data = df[[self.Area.FlowSignal, *fit_zeroflow.Station.FlowSignals]]**2
+            filter =  df[self.FlowSignal] < self.MinFlow # overwrite made predictions with better predictions
+            self.predicted_y[filter] = df[fit_zeroflow.Station.PressureSignal][filter] - model_zeroflow.predict(df_data[filter])    
+        self.predicted_y.name = f"{self.Name}_predicted"
+
+    def calc_bandwidth(self) -> None:
+        import math
+        PARAMETER_CLASSES = 5
+        average_pred =  self.predicted_y.mean()
+        deviation = self.predicted_y - self.df_filtered[self.PressureSignal]        
+        df_bandwith_dataset = pd.DataFrame(data={'prediction':self.predicted_y, 'measured':self.df_filtered[self.PressureSignal], 'deviationfactor':deviation/self.predicted_y})
+        size = math.ceil(df_bandwith_dataset.shape[0]/PARAMETER_CLASSES)
+        list_df = [df_bandwith_dataset.sort_values(by=['prediction'])[i:i+size] for i in range(0, df_bandwith_dataset.shape[0],size)]
+        parameter_set = []
+        for group in list_df:
+            average_pred = group['prediction'].mean()
+            average_deviationfactor = group['deviationfactor'].mean()
+            five_percent_heightest_deviation = np.percentile(group['deviationfactor'], 95) 
+            five_percent_lowest_deviation = np.percentile(group['deviationfactor'], 5) 
+            specific_deviation_factor_low = five_percent_heightest_deviation - average_deviationfactor
+            specific_deviation_factor_high = five_percent_lowest_deviation - average_deviationfactor
+            parameter_set.append([average_pred, average_deviationfactor, specific_deviation_factor_low, specific_deviation_factor_high])            
+
+        self.df_bandwith_parameter_set = pd.DataFrame(data=parameter_set, columns=['average_pred','average_deviation_factor','specific_deviation_factor_low','specific_deviation_factor_high'])
+        log.info(self.df_bandwith_parameter_set)
+
+        self.df_bandwidth = (pd.concat([self.predicted_y.to_frame() , self.df_bandwith_parameter_set])
+            .assign(tot_pred=lambda _df: _df[f"{self.Name}_predicted"].fillna(0) +_df['average_pred'].fillna(0))
+            .sort_values(by=['tot_pred'])
+            .interpolate(limit_direction='both')
+            .assign(limit_low=lambda _df: _df['tot_pred'] * (_df['average_deviation_factor'] + (_df['specific_deviation_factor_low'])),
+             limit_high=lambda _df: _df['tot_pred'] * (_df['average_deviation_factor'] + (_df['specific_deviation_factor_high'])))
+            .loc[lambda _df:~_df.index.isin(self.df_bandwith_parameter_set.index), :] # remove concatted df_parameter
+            .sort_index()            
+            [['limit_low','limit_high']]
+            )
+    
+    def post_processing(self) -> None:
+        """Write some data to parquet"""
+        self.df_results =  pd.DataFrame()        
+        for fit, _ in self.Models.items():         
+            self.df_results = self.df_results.join(pd.DataFrame.from_dict(data=fit.Quality, orient='index',columns=[fit.Name]), how='right')
+        self.df_bandwith_parameter_set.to_parquet(f'{RESULTS_DIR}/{self.Name}_parameter_set.parquet')
+        self.df_filtered[self.PressureSignal].to_frame().join(self.predicted_y).join(self.df_bandwidth).to_parquet(f'{RESULTS_DIR}/{self.Name}_predictions.parquet')        
+          
+    
+    def plot(self,start_date:datetime, end_date:datetime) -> None:
+        """Write interactive plots to file"""
+        df = self.df_filtered
+        df_m = (pd.melt(df[[self.PressureSignal, self.FlowSignal]]
+            .assign(predicted=self.predicted_y, lower_limit=self.predicted_y-self.df_bandwidth['limit_low'], higher_limit=self.predicted_y-self.df_bandwidth['limit_high'])        
+            .reset_index()
+            , id_vars=['PtimeStamp'],value_vars=[self.PressureSignal, 'predicted', self.FlowSignal,'lower_limit','higher_limit']))
+        fig = px.line(df_m, x="PtimeStamp",y="value",
+        labels={
+            "Timestamp":"Tijd",
+            "value":"Debiet/Druk",    
+            "variable":"Soort"               
+        },
+        color="variable",        )
+        fig.update_layout( # customize font and legend orientation & position
+        legend=dict(
+            title=None,orientation="h", y=-.2, yanchor="bottom", x=0.8, xanchor="center"
+        ),)
+        chart_name = f"{self.Name}"
+        fig.write_html(f'{RESULTS_DIR}/{chart_name}.html')
+        #fig.write_image(f'{RESULTS_DIR}/{chart_name}.png',height=525, width=1568)
+
+
+    def plot_bandwidth(self) -> None:
+        fig = go.Figure()        
+        y_upper = self.predicted_y-self.df_bandwidth['limit_high']
+        y_lower = self.predicted_y-self.df_bandwidth['limit_low']   
+
+        fig.add_trace(go.Scatter(x= self.predicted_y.index,
+            y=y_lower, 
+            fill=None,
+            mode='lines',
+            line_color='red',
+            showlegend=False
+            ))
+
+        fig.add_trace(go.Scatter(x= self.predicted_y.index,
+            y=y_upper, 
+            fill='tonexty', # fill area between trace0 and trace1
+            mode='lines', line_color='red',
+            name="Bandbreedte"
+            ))
+
+        fig.add_trace(go.Scatter(x= self.predicted_y.index,y=self.predicted_y, name='Voorspelling', line_color='blue'))
+        fig.add_trace(go.Scatter(x= self.predicted_y.index,y=self.df_filtered[self.PressureSignal], name='Meting', line_color='green'))
+        # fig.add_trace(go.Scatter(x= self.df_filtered[self.PressureSignal].index,y=self.df_filtered[self.PressureSignal], name=self.PressureSignal))
+        fig.update_layout({'title':self.Name})
+        #fig.show()
+        fig.write_html(f'{RESULTS_DIR}/{self.Name}_BandWidth.html')
+        pass
+
+    
+        
+@dataclass
+class Area:
+    Name:str
+    FlowSignal:str
+    Stations:List[Station]
+    Points:List[PressurePoint]
+    Data:pd.DataFrame
+    MinFlow:float = None
+    def init(self) -> None:
+        for point in self.Points:
+            point.init(self, self.Stations, self.Data)
+    def exec(self) -> None:
+        for point in self.Points:
+            point.exec()
+    def post_processing(self) -> None:
+        self.df_results =  pd.DataFrame()  
+        for point in self.Points:
+            point.post_processing()
+            self.df_results = self.df_results.join(point.df_results, how='right')
+        self.df_results.transpose().to_excel(f"{RESULTS_DIR}/fit.xlsx")
+        
+
+
+def _create_configuration(df_data:pd.DataFrame, df_validation:pd.DataFrame= None) -> Area:    
+    def create_points() -> List[PressurePoint]:
+        point1 = PressurePoint(Name='Usquert_In',PressureSignal='P_Usquert_In', FlowSignal='Usquert_In', MinFlow=10)
+        point2 = PressurePoint(Name='Eenrum_In',PressureSignal='P_Eenrum_In', FlowSignal='Eenrum_In', MinFlow=10)
+        point3 = PressurePoint(Name='Rixona',PressureSignal='P_Rixona', FlowSignal='Rixona', MinFlow=10)
+        point4 = PressurePoint(Name='PPG',PressureSignal='P_PPG', FlowSignal='PPG', MinFlow=10)
+        point5 = PressurePoint(Name='Lauwersoog_In',PressureSignal='P_Lauwersoog_In', FlowSignal='Lauwersoog_In', MinFlow=10)
+        return [point1, point2, point3, point4, point5]
+    station1 = Station(Name="Onnen", PressureSignal="P_Onnen_Uit", FlowSignals=["Onnen_Uit"], MinFlow=10)
+    station2 = Station(Name="Nietap", PressureSignal="P_Nietap_Uit", FlowSignals=["Nietap_Lettelbert","Nietap_Provincie"], MinFlow=10)
+    station3 = Station(Name="DeGroeve", PressureSignal="P_DeGroeve_Uit", FlowSignals=["DeGroeve_Uit"], MinFlow=10)    
+    return Area(Name='Provincie',FlowSignal=AREAS['Provincie'],Stations=[station1,station2, station3], Points=create_points(), Data=df_data)
+
+if __name__ == "__main__":
+    conf = _create_configuration(get_resampled_data().join(get_balance_data()))
+    conf.init()
+    conf.exec()
+    conf.post_processing()
+
+    
+    

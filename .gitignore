@@ -3,5 +3,6 @@
 todo.txt
 Log/**
 Data/**
+Results/**
 __pycache__
 .vscode
